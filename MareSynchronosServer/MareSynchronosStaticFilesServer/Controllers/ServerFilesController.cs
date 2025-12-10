@@ -1,4 +1,10 @@
-﻿using K4os.Compression.LZ4.Streams;
+﻿using System.Collections.Concurrent;
+using System.Security.Cryptography;
+using System.Security.Policy;
+using System.Text.Json;
+using System.Text.RegularExpressions;
+using Blake3;
+using K4os.Compression.LZ4.Streams;
 using MareSynchronos.API.Dto.Files;
 using MareSynchronos.API.Routes;
 using MareSynchronos.API.SignalR;
@@ -13,11 +19,7 @@ using MareSynchronosStaticFilesServer.Utils;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.AspNetCore.SignalR;
 using Microsoft.EntityFrameworkCore;
-using System.Collections.Concurrent;
-using System.Security.Cryptography;
-using System.Security.Policy;
-using System.Text.Json;
-using System.Text.RegularExpressions;
+using Snowcloak.Files;
 
 namespace MareSynchronosStaticFilesServer.Controllers;
 
@@ -188,43 +190,48 @@ public class ServerFilesController : ControllerBase
                 return Ok();
             }
 
+            _logger.LogInformation("[DEBUG] Receiving file {hash} from {user} at path {_basePath}", hash, MareUser, _basePath);
             var path = FilePathUtil.GetFilePath(_basePath, hash);
             var tmpPath = path + ".tmp";
             long compressedSize = -1;
 
             try
             {
-                // Write incoming file to a temporary file while also hashing the decompressed content
+                // ---
+                // My own implementation of the new SCF file format upload process because the official one is not public yet.
+                // Bit of a guess based on the SCFFile class and client but should work.
+                // ---
+                // 1. Save body as-is (SCF blob) to temp file
+                await using (var tmpFileStream = new FileStream(tmpPath, FileMode.Create, FileAccess.Write, FileShare.None))
+                {
+                    await Request.Body.CopyToAsync(tmpFileStream, requestAborted).ConfigureAwait(false);
+                }
 
-                // Stream flow diagram:
-                // Request.Body ==> (Tee) ==> FileStream
-                //                        ==> CountedStream ==> LZ4DecoderStream ==> HashingStream ==> Stream.Null
+                // 2. Validate SCF header and hash
+                await using (var scfStream = new FileStream(tmpPath, FileMode.Open, FileAccess.Read, FileShare.Read))
+                {
+                    // This only parses header, does NOT decompress
+                    var header = SCFFile.ReadHeader(scfStream);
 
-                // Reading via TeeStream causes the request body to be copied to tmpPath
-                using var tmpFileStream = new FileStream(tmpPath, FileMode.Create);
-                using var teeStream = new TeeStream(Request.Body, tmpFileStream);
-                teeStream.DisposeUnderlying = false;
-                // Read via CountedStream to count the number of compressed bytes
-                using var countStream = new CountedStream(teeStream);
-                countStream.DisposeUnderlying = false;
+                    // Sanity: header.Hash must match route param 'hash'
+                    if (!string.Equals(header.Hash, hash, StringComparison.OrdinalIgnoreCase))
+                    {
+                        throw new InvalidDataException($"SCF: Hash mismatch. Header={header.Hash}, Route={hash}");
+                    }
 
-                // The decompressed file content is read through LZ4DecoderStream, and written out to HashingStream
-                using var decStream = LZ4Stream.Decode(countStream, extraMemory: 0, leaveOpen: true);
-                // HashingStream simply hashes the decompressed bytes without writing them anywhere
-                using var hashStream = new HashingStream(Stream.Null, SHA1.Create());
-                hashStream.DisposeUnderlying = false;
+                    // Optionally, we can also sanity-check compressed size vs file length:
+                    var fileLength = scfStream.Length;
+                    var expectedLength = (long)header.CompressedSize + 79; // 79-byte header
+                    if (fileLength < expectedLength)
+                    {
+                        throw new InvalidDataException($"SCF: File too short. Length={fileLength}, Expected>={expectedLength}");
+                    }
 
-                await decStream.CopyToAsync(hashStream, requestAborted).ConfigureAwait(false);
-                decStream.Close();
+                    // For DB / metadata: treat compressedSize as total SCF size
+                    compressedSize = fileLength;
+                }
 
-                var hashString = BitConverter.ToString(hashStream.Finish())
-                    .Replace("-", "", StringComparison.Ordinal).ToUpperInvariant();
-                if (!string.Equals(hashString, hash, StringComparison.Ordinal))
-                    throw new InvalidOperationException($"Hash does not match file, computed: {hashString}, expected: {hash}");
-
-                compressedSize = countStream.BytesRead;
-
-                // File content is verified -- move it to its final location
+                // 3. Move verified SCF file into place
                 System.IO.File.Move(tmpPath, path, true);
             }
             catch
@@ -233,7 +240,8 @@ public class ServerFilesController : ControllerBase
                 {
                     System.IO.File.Delete(tmpPath);
                 }
-                catch { }
+                catch { /* ignore cleanup errors */ }
+
                 throw;
             }
 
